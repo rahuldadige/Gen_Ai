@@ -1,11 +1,14 @@
 import tkinter as tk
-from tkinter import messagebox, Frame
+from tkinter import messagebox, Frame, Text, Scrollbar
 from PIL import Image, ImageTk
 import chess
 import chess.engine
+import google.generativeai as genai
+import os
+from dotenv import load_dotenv
 
-# Path to Stockfish engine (UPDATE THIS PATH IF NEEDED)
-STOCKFISH_PATH = r"C:\Users\RAhul\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
+# Load environment variables
+load_dotenv()
 
 class ChessGUI:
     def __init__(self, root):
@@ -14,15 +17,30 @@ class ChessGUI:
         self.board = chess.Board()
         self.previous_move = None  # Store last move
         
+        # Add AI feature flags
+        self.show_commentary = tk.BooleanVar(value=False)
+        self.show_suggestions = tk.BooleanVar(value=True)
+        self.show_move_judgment = tk.BooleanVar(value=False)
+        
+        # Set Stockfish path
+        self.STOCKFISH_PATH = r"C:\Users\RAhul\Downloads\stockfish-windows-x86-64-avx2\stockfish\stockfish-windows-x86-64-avx2.exe"
+        
+        # Track game history
+        self.move_history = []  # Store all moves in the game
+        self.position_history = []  # Store FEN positions after each move
+        
         # Track wins for adaptive AI
         self.user_wins = 0
         self.ai_wins = 0
         
         # Flag to control suggestion visibility
-        self.show_suggestions = False
+        self.show_suggestions = True
 
         # AI ELO rating for Stockfish (set to a minimum of 1320)
         self.ai_elo = 1320  # Default AI ELO (can be adjusted for difficulty)
+
+        # Initialize Gemini API
+        self.initialize_gemini_api()
 
         # Define colors and dimensions to match the screenshot
         self.SQUARE_SIZE = 60
@@ -31,8 +49,8 @@ class ChessGUI:
         self.LIGHT_SQUARE = "#F0D9B5"  # Light beige
         self.DARK_SQUARE = "#B58863"   # Dark brown
         self.HIGHLIGHT_COLOR = "#FFFF00"  # Yellow highlight for selected square
-        self.MOVE_HIGHLIGHT = "#A3D8F4"  # Light blue highlight for possible moves (as seen in screenshot)
-        self.BG_COLOR = "#2C3E50"  # Dark blue-gray background (matching screenshot)
+        self.MOVE_HIGHLIGHT = "#A3D8F4"  # Light blue highlight for possible moves
+        self.BG_COLOR = "#2C3E50"  # Dark blue-gray background
         
         # Configure the root window
         self.root.configure(bg=self.BG_COLOR)
@@ -48,8 +66,28 @@ class ChessGUI:
         
         # Create board frame
         board_frame = Frame(main_frame, bg=self.BG_COLOR)
-        board_frame.pack()
-
+        board_frame.pack(side=tk.LEFT, padx=(0, 10))
+        
+        # Create chat frame
+        chat_frame = Frame(main_frame, bg=self.BG_COLOR)
+        chat_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        
+        # Create chat display
+        self.chat_display = Text(chat_frame, wrap=tk.WORD, height=20, width=40, bg="#34495E", fg="white")
+        self.chat_display.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+        
+        # Create chat input
+        self.chat_input = Text(chat_frame, wrap=tk.WORD, height=3, width=40, bg="#34495E", fg="white")
+        self.chat_input.pack(fill=tk.X, pady=(0, 5))
+        
+        # Create send button
+        send_button = tk.Button(chat_frame, text="Send", command=self.send_message, bg="#3498DB", fg="white")
+        send_button.pack(side=tk.RIGHT)
+        
+        # Create suggestion button
+        suggestion_button = tk.Button(chat_frame, text="Get Suggestion", command=self.get_ai_suggestion, bg="#2ECC71", fg="white")
+        suggestion_button.pack(side=tk.LEFT)
+        
         # Chess canvas
         self.canvas = tk.Canvas(board_frame, width=self.BOARD_SIZE, height=self.BOARD_SIZE,
                                highlightthickness=0)
@@ -58,6 +96,9 @@ class ChessGUI:
         # Info panel layout that matches the screenshot
         info_frame = Frame(main_frame, bg=self.BG_COLOR, pady=10)
         info_frame.pack(fill=tk.X)
+        
+        # Initialize Stockfish engine
+        self.initialize_stockfish()
         
         # User info (left side as in screenshot)
         self.user_label = tk.Label(info_frame, text=f"You (White): {self.user_wins} wins", 
@@ -109,26 +150,103 @@ class ChessGUI:
         # Initially hide the suggestion text
         self.textbox.insert(tk.END, "Suggestions are turned off")
 
-        self.draw_board()
+        # Create AI features frame (add this after the tips_frame)
+        ai_features_frame = Frame(main_frame, bg=self.BG_COLOR, pady=5)
+        ai_features_frame.pack(fill=tk.X)
+        
+        # Add checkboxes for AI features
+        tk.Checkbutton(ai_features_frame, text="Live Commentary", 
+                      variable=self.show_commentary,
+                      command=self.toggle_commentary,
+                      fg="white", bg=self.BG_COLOR,
+                      selectcolor="#1A2638",
+                      activebackground=self.BG_COLOR,
+                      activeforeground="white").pack(side=tk.LEFT, padx=5)
+                      
+        tk.Checkbutton(ai_features_frame, text="Move Suggestions", 
+                      variable=self.show_suggestions,
+                      command=self.toggle_suggestions,
+                      fg="white", bg=self.BG_COLOR,
+                      selectcolor="#1A2638",
+                      activebackground=self.BG_COLOR,
+                      activeforeground="white").pack(side=tk.LEFT, padx=5)
+                      
+        tk.Checkbutton(ai_features_frame, text="Move Judgment", 
+                      variable=self.show_move_judgment,
+                      command=self.toggle_judgment,
+                      fg="white", bg=self.BG_COLOR,
+                      selectcolor="#1A2638",
+                      activebackground=self.BG_COLOR,
+                      activeforeground="white").pack(side=tk.LEFT, padx=5)
 
-        # AI Engine
-        try:
-            self.engine = chess.engine.SimpleEngine.popen_uci(STOCKFISH_PATH)
-            print("✅ Stockfish engine loaded successfully!")
-        except Exception as e:
-            print("❌ Error loading Stockfish:", e)
-            messagebox.showerror("Error", "Stockfish engine could not be loaded.")
-            return
+        self.draw_board()
 
         # Bind mouse click event
         self.canvas.bind("<Button-1>", self.on_click)
         self.selected_square = None
 
+    def initialize_gemini_api(self):
+        """Initialize the Gemini API with proper configuration"""
+        try:
+            GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
+            if not GOOGLE_API_KEY:
+                raise ValueError("GOOGLE_API_KEY not found in environment variables")
+            
+            print("Configuring Gemini API...")
+            genai.configure(api_key=GOOGLE_API_KEY)
+            
+            # Get available models
+            print("Checking available models...")
+            for m in genai.list_models():
+                print(f"Found model: {m.name}")
+            
+            print("Creating Gemini model...")
+            generation_config = {
+                "temperature": 0.9,
+                "top_p": 1,
+                "top_k": 1,
+                "max_output_tokens": 2048,
+            }
+            
+            safety_settings = [
+                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
+            ]
+            
+            # Try different model versions in order of preference
+            model_versions = ['gemini-1.5-pro', 'gemini-1.5-pro-latest', 'gemini-pro']
+            self.model = None
+            last_error = None
+            
+            for model_name in model_versions:
+                try:
+                    print(f"Trying model: {model_name}")
+                    self.model = genai.GenerativeModel(model_name=model_name,
+                                                   generation_config=generation_config,
+                                                   safety_settings=safety_settings)
+                    # Test the model
+                    response = self.model.generate_content('Test connection')
+                    print(f"Successfully connected to {model_name}")
+                    break
+                except Exception as e:
+                    print(f"Failed to initialize {model_name}: {str(e)}")
+                    last_error = e
+                    continue
+            
+            if self.model is None:
+                raise Exception(f"Failed to initialize any model. Last error: {str(last_error)}")
+            
+            print("✅ Gemini API connection successful!")
+        except Exception as e:
+            error_msg = f"Error configuring Gemini API: {str(e)}"
+            print(f"❌ {error_msg}")
+            messagebox.showerror("Error", f"Failed to initialize AI model: {str(e)}")
+
     def toggle_suggestions(self):
         """Toggle the visibility of move suggestions."""
-        self.show_suggestions = self.toggle_var.get()
-        
-        if self.show_suggestions:
+        if self.show_suggestions.get():
             self.show_best_move_tip()  # Show suggestion immediately when turned on
         else:
             self.textbox.delete(1.0, tk.END)
@@ -268,11 +386,18 @@ class ChessGUI:
                 self.selected_square = None  # Reset selection
                 self.draw_board()
                 
-                # Only show the tip if suggestions are enabled
-                if self.show_suggestions:
+                # Add AI features after move
+                if self.show_commentary.get():
+                    self.get_game_commentary()
+                if self.show_move_judgment.get():
+                    self.judge_last_move()
+                if self.show_suggestions.get():
                     self.show_best_move_tip()
                     
-                self.root.after(500, self.ai_move)  # Delay AI move by 0.5 seconds
+                self.root.after(500, self.ai_move)
+                
+                # After a successful move, update game history
+                self.update_game_history(move)
             else:
                 print("❌ Invalid move!")
                 self.selected_square = None  # Reset selection
@@ -384,11 +509,18 @@ class ChessGUI:
                 self.board.push(result.move)
                 self.draw_board()
                 
-                # Only show the best move tip if suggestions are turned on
-                if self.show_suggestions:
+                # Add AI features after AI move
+                if self.show_commentary.get():
+                    self.get_game_commentary()
+                if self.show_move_judgment.get():
+                    self.judge_last_move()
+                if self.show_suggestions.get():
                     self.show_best_move_tip()
                     
                 self.check_game_status()
+                
+                # After AI makes a move, update game history
+                self.update_game_history(result.move)
 
             except Exception as e:
                 print("❌ Error during AI move:", e)
@@ -397,22 +529,21 @@ class ChessGUI:
 
     def show_best_move_tip(self):
         """Displays the best move suggestion for the human player."""
-        # Don't show suggestions if they're turned off
-        if not self.show_suggestions:
-            return
-            
-        # Clear the textbox and insert the best human move
-        self.textbox.delete(1.0, tk.END)  # Clear current text
+        print("Attempting to show best move tip...")
+        print(f"Suggestions enabled: {self.show_suggestions.get()}")
         
-        if self.board.is_game_over():
-            self.textbox.insert(tk.END, "Game is over.")
+        if not self.show_suggestions.get():
+            print("Suggestions are turned off")
             return
-            
-        # Get the best move for the human player
+        
+        print("Getting best move...")
         best_move = self.get_best_human_move()
         if best_move == chess.Move.null():
+            print("No valid move found")
             return
-            
+        
+        print(f"Best move found: {best_move}")
+        
         from_square = chess.square_name(best_move.from_square)
         to_square = chess.square_name(best_move.to_square)
         
@@ -483,13 +614,14 @@ class ChessGUI:
         self.selected_square = None
         self.previous_move = None
         self.draw_board()
+        
         self.status_label.config(text="Game Status: White to move")
         
         # Clear the textbox
         self.textbox.delete(1.0, tk.END)
         
         # Only show suggestions if they're turned on
-        if self.show_suggestions:
+        if self.show_suggestions.get():
             self.show_best_move_tip()
         else:
             self.textbox.insert(tk.END, "Suggestions are turned off")
@@ -508,6 +640,158 @@ class ChessGUI:
         self.close_engine()
         self.root.destroy()
 
+    def update_game_history(self, move):
+        """Update the game history after each move"""
+        self.move_history.append(str(move))
+        self.position_history.append(self.board.fen())
+
+    def get_game_context(self):
+        """Get formatted game context for Gemini API"""
+        context = "Game History:\n"
+        for i, (move, position) in enumerate(zip(self.move_history, self.position_history)):
+            turn = "White" if i % 2 == 0 else "Black"
+            context += f"Move {i+1}. {turn}: {move} (Position: {position})\n"
+        context += f"\nCurrent Position: {self.board.fen()}\n"
+        context += f"Current Turn: {'White' if self.board.turn else 'Black'}"
+        return context
+
+    def get_ai_suggestion(self):
+        """Get a suggested move from Gemini AI with full game context"""
+        try:
+            # Create a prompt with full game context
+            context = self.get_game_context()
+            prompt = f"""As a chess expert, analyze this position briefly:
+
+{context}
+
+Provide only:
+1. Best move in standard notation (e.g., e2e4)
+2. One sentence explanation why this move is good.
+Be concise."""
+            
+            # Get response from Gemini
+            response = self.model.generate_content(prompt)
+            suggestion = response.text
+            
+            # Display the suggestion in the chat
+            self.chat_display.insert(tk.END, f"\nAI Suggestion: {suggestion}\n")
+            self.chat_display.see(tk.END)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to get AI suggestion: {str(e)}")
+    
+    def send_message(self):
+        """Send a message to the AI and get a response with full game context"""
+        try:
+            # Get the message from the input
+            message = self.chat_input.get("1.0", tk.END).strip()
+            if not message:
+                return
+                
+            # Display user message
+            self.chat_display.insert(tk.END, f"\nYou: {message}\n")
+            self.chat_input.delete("1.0", tk.END)
+            
+            # Create a prompt with full game context
+            context = self.get_game_context()
+            prompt = f"""You are a chess assistant. Current game state:
+
+{context}
+
+User: {message}
+
+Provide a brief, direct response in 1-2 sentences."""
+            
+            # Get response from Gemini
+            response = self.model.generate_content(prompt)
+            ai_response = response.text
+            
+            # Display AI response
+            self.chat_display.insert(tk.END, f"\nAI: {ai_response}\n")
+            self.chat_display.see(tk.END)
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to send message: {str(e)}")
+
+    def initialize_stockfish(self):
+        """Initialize the Stockfish chess engine"""
+        try:
+            print(f"Loading Stockfish from: {self.STOCKFISH_PATH}")
+            if not os.path.exists(self.STOCKFISH_PATH):
+                raise FileNotFoundError(f"Stockfish executable not found at: {self.STOCKFISH_PATH}")
+            
+            self.engine = chess.engine.SimpleEngine.popen_uci(self.STOCKFISH_PATH)
+            print("✅ Stockfish engine loaded successfully!")
+        except Exception as e:
+            print(f"❌ Error loading Stockfish: {str(e)}")
+            messagebox.showerror("Error", f"Stockfish engine could not be loaded: {str(e)}\nPlease verify the path: {self.STOCKFISH_PATH}")
+            self.engine = None
+
+    def toggle_commentary(self):
+        """Toggle live game commentary"""
+        if self.show_commentary.get():
+            self.get_game_commentary()
+        else:
+            self.chat_display.insert(tk.END, "\nCommentary turned off\n")
+            self.chat_display.see(tk.END)
+
+    def toggle_judgment(self):
+        """Toggle move judgment"""
+        if self.show_move_judgment.get():
+            self.judge_last_move()
+        else:
+            self.chat_display.insert(tk.END, "\nMove judgment turned off\n")
+            self.chat_display.see(tk.END)
+
+    def get_game_commentary(self):
+        """Get real-time commentary about the current game state"""
+        try:
+            context = self.get_game_context()
+            prompt = f"""As a chess commentator, provide a brief, engaging commentary about the current game state:
+
+{context}
+
+Focus on:
+1. Current position evaluation
+2. Key tactical or strategic elements
+3. Potential threats or opportunities
+Keep it concise and engaging."""
+            
+            response = self.model.generate_content(prompt)
+            commentary = response.text
+            
+            self.chat_display.insert(tk.END, f"\nCommentary: {commentary}\n")
+            self.chat_display.see(tk.END)
+            
+        except Exception as e:
+            print(f"Error getting commentary: {e}")
+
+    def judge_last_move(self):
+        """Judge the last move made in the game"""
+        try:
+            if not self.previous_move:
+                return
+                
+            context = self.get_game_context()
+            prompt = f"""As a chess expert, evaluate the last move made in this game:
+
+{context}
+
+Last move: {self.previous_move}
+
+Provide a brief evaluation:
+1. Is it a good move? (Excellent/Good/Questionable/Poor)
+2. One sentence explanation why
+Keep it concise."""
+            
+            response = self.model.generate_content(prompt)
+            judgment = response.text
+            
+            self.chat_display.insert(tk.END, f"\nMove Judgment: {judgment}\n")
+            self.chat_display.see(tk.END)
+            
+        except Exception as e:
+            print(f"Error judging move: {e}")
 
 if __name__ == "__main__":
     root = tk.Tk()
