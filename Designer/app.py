@@ -32,12 +32,21 @@ class ChessGUI:
         # Track wins for adaptive AI
         self.user_wins = 0
         self.ai_wins = 0
+        self.consecutive_user_wins = 0
+        self.consecutive_ai_wins = 0
+        self.draws = 0
         
-        # Flag to control suggestion visibility
-        self.show_suggestions = True
+        # Track move quality for dynamic adjustment
+        self.user_move_quality = []  # Store accuracy of recent moves
+        self.recent_game_results = []  # Store recent game outcomes
+        
+        # Flag to control suggestion visibility (as BooleanVar)
+        self.show_suggestions = tk.BooleanVar(value=True)
 
         # AI ELO rating for Stockfish (set to a minimum of 1320)
         self.ai_elo = 1320  # Default AI ELO (can be adjusted for difficulty)
+        self.min_elo = 800   # Minimum difficulty
+        self.max_elo = 3000  # Maximum difficulty
 
         # Initialize Gemini API
         self.initialize_gemini_api()
@@ -106,7 +115,7 @@ class ChessGUI:
         self.user_label.pack(side=tk.LEFT)
         
         # AI info (right side as in screenshot)
-        self.ai_label = tk.Label(info_frame, text=f"AI (Black): {self.ai_wins} wins", 
+        self.ai_label = tk.Label(info_frame, text=f"AI (Black): {self.ai_wins} wins | ELO: {self.ai_elo}", 
                                 fg="white", bg=self.BG_COLOR, font=("Arial", 10))
         self.ai_label.pack(side=tk.RIGHT)
         
@@ -179,6 +188,23 @@ class ChessGUI:
                       activebackground=self.BG_COLOR,
                       activeforeground="white").pack(side=tk.LEFT, padx=5)
 
+        # Add manual difficulty adjustment slider
+        difficulty_frame = Frame(main_frame, bg=self.BG_COLOR, pady=5)
+        difficulty_frame.pack(fill=tk.X)
+        
+        tk.Label(difficulty_frame, text="Manual ELO Adjustment:", 
+                fg="white", bg=self.BG_COLOR, font=("Arial", 10)).pack(side=tk.LEFT, padx=5)
+        
+        self.difficulty_slider = tk.Scale(difficulty_frame, from_=self.min_elo, to=self.max_elo,
+                                         orient=tk.HORIZONTAL, bg=self.BG_COLOR, fg="white",
+                                         highlightthickness=0, length=200,
+                                         command=self.manual_difficulty_adjustment)
+        self.difficulty_slider.set(self.ai_elo)
+        self.difficulty_slider.pack(side=tk.LEFT, padx=5)
+        
+        tk.Label(difficulty_frame, text="(Overrides auto-adjustment)", 
+                fg="#95A5A6", bg=self.BG_COLOR, font=("Arial", 8, "italic")).pack(side=tk.LEFT, padx=5)
+
         self.draw_board()
 
         # Bind mouse click event
@@ -202,10 +228,10 @@ class ChessGUI:
             
             print("Creating Gemini model...")
             generation_config = {
-                "temperature": 0.9,
-                "top_p": 1,
-                "top_k": 1,
-                "max_output_tokens": 2048,
+                "temperature": 0.7,
+                "top_p": 0.95,
+                "top_k": 40,
+                "max_output_tokens": 1024,
             }
             
             safety_settings = [
@@ -216,7 +242,14 @@ class ChessGUI:
             ]
             
             # Try different model versions in order of preference
-            model_versions = ['gemini-1.5-pro', 'gemini-1.5-pro-latest', 'gemini-pro']
+            model_versions = [
+                'gemini-2.5-flash',
+                'gemini-2.5-pro',
+                'gemini-2.0-flash',
+                'gemini-2.0-flash-001',
+                'gemini-flash-latest',
+                'gemini-pro-latest'
+            ]
             self.model = None
             last_error = None
             
@@ -226,9 +259,7 @@ class ChessGUI:
                     self.model = genai.GenerativeModel(model_name=model_name,
                                                    generation_config=generation_config,
                                                    safety_settings=safety_settings)
-                    # Test the model
-                    response = self.model.generate_content('Test connection')
-                    print(f"Successfully connected to {model_name}")
+                    print(f"✅ Configured {model_name}")
                     break
                 except Exception as e:
                     print(f"Failed to initialize {model_name}: {str(e)}")
@@ -340,7 +371,7 @@ class ChessGUI:
         
         # Update win counters
         self.user_label.config(text=f"You (White): {self.user_wins} wins")
-        self.ai_label.config(text=f"AI (Black): {self.ai_wins} wins")
+        self.ai_label.config(text=f"AI (Black): {self.ai_wins} wins | ELO: {self.ai_elo}")
 
     def on_click(self, event):
         """Handles piece selection and movement."""
@@ -385,6 +416,11 @@ class ChessGUI:
                 self.board.push(move)
                 self.selected_square = None  # Reset selection
                 self.draw_board()
+                
+                # Evaluate the move and adjust AI difficulty immediately
+                move_quality = self.evaluate_move_quality(move)
+                if move_quality is not None:
+                    self.adjust_ai_difficulty_dynamic(move_quality)
                 
                 # Add AI features after move
                 if self.show_commentary.get():
@@ -498,115 +534,262 @@ class ChessGUI:
 
     def ai_move(self):
         """AI makes a move using Stockfish with ELO scaling."""
-        if not self.board.is_game_over() and self.engine:
+        if not self.board.is_game_over():
+            if not self.engine:
+                try:
+                    # Try to reinitialize the engine if it's not available
+                    self.initialize_stockfish()
+                except Exception as e:
+                    print("❌ Could not initialize Stockfish:", e)
+                    return
+
             try:
-                self.engine.configure({"UCI_LimitStrength": True})
-                self.engine.configure({"UCI_Elo": self.ai_elo})
-
-                # AI makes a move
-                result = self.engine.play(self.board, chess.engine.Limit(time=1))
-                self.previous_move = result.move  # Store the AI's move
-                self.board.push(result.move)
-                self.draw_board()
-                
-                # Add AI features after AI move
-                if self.show_commentary.get():
-                    self.get_game_commentary()
-                if self.show_move_judgment.get():
-                    self.judge_last_move()
-                if self.show_suggestions.get():
-                    self.show_best_move_tip()
+                # Configure engine with safety checks
+                try:
+                    self.engine.configure({"UCI_LimitStrength": True})
+                    self.engine.configure({"UCI_Elo": self.ai_elo})
+                except Exception as config_error:
+                    print("⚠️ Could not configure engine strength, using default settings")
                     
-                self.check_game_status()
-                
-                # After AI makes a move, update game history
-                self.update_game_history(result.move)
+                # AI makes a move with timeout protection
+                result = self.engine.play(self.board, chess.engine.Limit(time=1))
+                if result.move:
+                    self.previous_move = result.move  # Store the AI's move
+                    self.board.push(result.move)
+                    self.draw_board()
+                    
+                    # Add AI features after AI move
+                    if hasattr(self, 'show_commentary') and isinstance(self.show_commentary, tk.BooleanVar) and self.show_commentary.get():
+                        self.get_game_commentary()
+                    if hasattr(self, 'show_move_judgment') and isinstance(self.show_move_judgment, tk.BooleanVar) and self.show_move_judgment.get():
+                        self.judge_last_move()
+                    if hasattr(self, 'show_suggestions') and isinstance(self.show_suggestions, tk.BooleanVar) and self.show_suggestions.get():
+                        self.show_best_move_tip()
+                        
+                    self.check_game_status()
+                    
+                    # After AI makes a move, update game history
+                    self.update_game_history(result.move)
+                else:
+                    print("⚠️ AI did not return a move")
 
+            except chess.engine.EngineTerminatedError:
+                print("❌ Engine terminated, attempting to restart...")
+                try:
+                    self.initialize_stockfish()
+                except Exception as e:
+                    print("❌ Could not restart engine:", e)
+                
             except Exception as e:
                 print("❌ Error during AI move:", e)
-                messagebox.showerror("Error", "An error occurred with the AI engine.")
-                self.engine.quit()  # Quit the engine if an error occurs
+                messagebox.showerror("Error", "An error occurred with the AI engine. The game will continue without AI moves.")
+                try:
+                    if self.engine:
+                        self.engine.quit()
+                except Exception:
+                    pass  # Ignore errors during cleanup
 
     def show_best_move_tip(self):
         """Displays the best move suggestion for the human player."""
-        print("Attempting to show best move tip...")
-        print(f"Suggestions enabled: {self.show_suggestions.get()}")
-        
-        if not self.show_suggestions.get():
-            print("Suggestions are turned off")
-            return
-        
-        print("Getting best move...")
-        best_move = self.get_best_human_move()
-        if best_move == chess.Move.null():
-            print("No valid move found")
-            return
-        
-        print(f"Best move found: {best_move}")
-        
-        from_square = chess.square_name(best_move.from_square)
-        to_square = chess.square_name(best_move.to_square)
-        
-        # Get the piece type
-        piece = self.board.piece_at(best_move.from_square)
-        if piece:
-            piece_name = "Pawn" if piece.piece_type == chess.PAWN else chess.piece_name(piece.piece_type).capitalize()
+        try:
+            print("Attempting to show best move tip...")
+            print(f"Suggestions enabled: {self.show_suggestions.get()}")
             
-            # Format exactly as in the screenshot
-            move_text = f"Best move: {piece_name} from {from_square} to {to_square}"
+            if not self.show_suggestions.get():
+                print("Suggestions are turned off")
+                return
             
-            self.textbox.insert(tk.END, move_text)
+            print("Getting best move...")
+            best_move = self.get_best_human_move()
+            if best_move == chess.Move.null():
+                print("No valid move found")
+                return
+            
+            print(f"Best move found: {best_move}")
+            
+            from_square = chess.square_name(best_move.from_square)
+            to_square = chess.square_name(best_move.to_square)
+            
+            # Get the piece type
+            piece = self.board.piece_at(best_move.from_square)
+            if piece:
+                piece_name = "Pawn" if piece.piece_type == chess.PAWN else chess.piece_name(piece.piece_type).capitalize()
+                
+                # Format exactly as in the screenshot
+                move_text = f"Best move: {piece_name} from {from_square} to {to_square}"
+                
+                # Clear and update textbox
+                self.textbox.delete(1.0, tk.END)
+                self.textbox.insert(tk.END, move_text)
+        except Exception as e:
+            print(f"⚠️ Error showing best move tip: {e}")
+            return
 
     def get_best_human_move(self):
         """Uses Stockfish to analyze and return the best move for the human player."""
-        if self.engine and not self.board.is_game_over():
-            try:
+        try:
+            if self.engine and not self.board.is_game_over():
                 # Analyze the current position for the best human move
                 result = self.engine.play(self.board, chess.engine.Limit(time=1))
-                return result.move
-            except Exception as e:
-                print("❌ Error analyzing the position:", e)
-                return chess.Move.null()
-        return chess.Move.null()
+                return result.move if result and result.move else chess.Move.null()
+            return chess.Move.null()
+        except Exception as e:
+            print(f"⚠️ Error analyzing position: {e}")
+            return chess.Move.null()
 
     def check_game_status(self):
         """Check if the game is over and update win counts."""
         if self.board.is_checkmate():
             if self.board.turn == chess.WHITE:  # AI wins
                 self.ai_wins += 1
+                self.consecutive_ai_wins += 1
+                self.consecutive_user_wins = 0
+                self.recent_game_results.append('ai_win')
                 winner = "AI (Black)"
             else:  # User wins
                 self.user_wins += 1
+                self.consecutive_user_wins += 1
+                self.consecutive_ai_wins = 0
+                self.recent_game_results.append('user_win')
                 winner = "You (White)"
+
+            # Keep only last 10 game results
+            if len(self.recent_game_results) > 10:
+                self.recent_game_results.pop(0)
 
             # Update labels immediately
             self.user_label.config(text=f"You (White): {self.user_wins} wins")
-            self.ai_label.config(text=f"AI (Black): {self.ai_wins} wins")
+            self.ai_label.config(text=f"AI (Black): {self.ai_wins} wins | ELO: {self.ai_elo}")
             
             messagebox.showinfo("Game Over", f"Checkmate! {winner} wins.")
-            
-            # Adjust AI difficulty based on results
-            self.adjust_ai_difficulty()
+            self.reset_game()
 
         elif self.board.is_stalemate():
             messagebox.showinfo("Game Over", "Stalemate! It's a draw.")
+            self.draws += 1
+            self.recent_game_results.append('draw')
+            if len(self.recent_game_results) > 10:
+                self.recent_game_results.pop(0)
         elif self.board.is_insufficient_material():
             messagebox.showinfo("Game Over", "Insufficient material! It's a draw.")
+            self.draws += 1
         elif self.board.is_fifty_moves():
             messagebox.showinfo("Game Over", "Fifty-move rule! It's a draw.")
+            self.draws += 1
         elif self.board.is_repetition():
             messagebox.showinfo("Game Over", "Threefold repetition! It's a draw.")
+            self.draws += 1
 
-    def adjust_ai_difficulty(self):
-        """Adjust AI difficulty based on game results."""
-        # If player is winning too much, increase AI difficulty
-        if self.user_wins > self.ai_wins + 2:
-            self.ai_elo = min(3000, self.ai_elo + 100)
-            print(f"🔼 Increasing AI difficulty to ELO {self.ai_elo}")
-        # If AI is winning too much, decrease difficulty
-        elif self.ai_wins > self.user_wins + 2:
-            self.ai_elo = max(1320, self.ai_elo - 100)
-            print(f"🔽 Decreasing AI difficulty to ELO {self.ai_elo}")
+    def evaluate_move_quality(self, move):
+        """Evaluate the quality of user's move compared to best move."""
+        try:
+            if not self.engine:
+                return None
+
+            quality = 0.5
+            
+            # Create a board position BEFORE the move
+            temp_board = self.board.copy()
+            temp_board.pop()  # Undo the move that was just made
+            
+            # Get the best move for this position
+            result = self.engine.play(temp_board, chess.engine.Limit(time=0.3))
+            best_move = result.move
+            
+            # Compare user move with best move
+            if move == best_move:
+                quality = 1.0
+                self.user_move_quality.append(quality)  # Perfect move
+                print("⭐ Perfect move!")
+            else:
+                # Evaluate position after best move
+                temp_board.push(best_move)
+                best_eval = self.engine.analyse(temp_board, chess.engine.Limit(time=0.2))
+                temp_board.pop()
+                
+                # Evaluate position after user move
+                temp_board.push(move)
+                user_eval = self.engine.analyse(temp_board, chess.engine.Limit(time=0.2))
+                
+                # Calculate quality (0.0 to 1.0)
+                try:
+                    best_score = best_eval.get('score', chess.engine.PovScore(chess.engine.Cp(0), chess.WHITE)).relative.score(mate_score=10000) or 0
+                    user_score = user_eval.get('score', chess.engine.PovScore(chess.engine.Cp(0), chess.WHITE)).relative.score(mate_score=10000) or 0
+                    diff = abs(best_score - user_score)
+                    quality = max(0.0, 1.0 - (diff / 300.0))  # Normalize difference
+                    self.user_move_quality.append(quality)
+                    
+                    if quality >= 0.8:
+                        print(f"✅ Excellent move quality: {quality:.1%}")
+                    elif quality >= 0.5:
+                        print(f"👍 Good move quality: {quality:.1%}")
+                    else:
+                        print(f"⚠️ Move quality: {quality:.1%}")
+                except:
+                    self.user_move_quality.append(0.5)  # Neutral if can't evaluate
+            
+            # Keep only last 20 moves
+            if len(self.user_move_quality) > 20:
+                self.user_move_quality.pop(0)
+
+            return quality
+                
+        except Exception as e:
+            print(f"⚠️ Could not evaluate move quality: {e}")
+            # Don't crash, just skip this evaluation
+            return None
+
+    def adjust_ai_difficulty_dynamic(self, move_quality=None):
+        """Adjust AI difficulty immediately after each move."""
+        if move_quality is None:
+            if not self.user_move_quality:
+                return
+            recent_quality = self.user_move_quality[-1]
+        else:
+            recent_quality = move_quality
+
+        if len(self.user_move_quality) >= 3:
+            recent_quality = sum(self.user_move_quality[-3:]) / min(3, len(self.user_move_quality))
+
+        old_elo = self.ai_elo
+
+        # Adjust based on the latest move quality, with a small rolling average
+        if recent_quality >= 0.90:
+            delta = 15
+            print(f"⭐ Strong move detected ({recent_quality:.1%}); increasing difficulty")
+        elif recent_quality >= 0.75:
+            delta = 10
+            print(f"✅ Good move detected ({recent_quality:.1%}); nudging difficulty up")
+        elif recent_quality >= 0.55:
+            delta = 0
+            print(f"➖ Neutral move detected ({recent_quality:.1%}); keeping difficulty steady")
+        elif recent_quality >= 0.40:
+            delta = -10
+            print(f"⚠️ Weak move detected ({recent_quality:.1%}); easing difficulty")
+        else:
+            delta = -20
+            print(f"📉 Very weak move detected ({recent_quality:.1%}); easing difficulty more")
+
+        self.ai_elo = max(self.min_elo, min(self.max_elo, self.ai_elo + delta))
+        
+        # Ensure ELO stays within bounds
+        self.ai_elo = max(self.min_elo, min(self.max_elo, self.ai_elo))
+        
+        if old_elo != self.ai_elo:
+            print(f"🎯 AI ELO adjusted: {old_elo} → {self.ai_elo}")
+            
+            try:
+                self.ai_label.config(text=f"AI (Black): {self.ai_wins} wins | ELO: {self.ai_elo}")
+                
+                # Show notification to user if chat display exists
+                if hasattr(self, 'chat_display') and self.chat_display:
+                    if self.ai_elo > old_elo:
+                        self.chat_display.insert(tk.END, f"\n🔼 AI difficulty increased to ELO {self.ai_elo}\n")
+                    else:
+                        self.chat_display.insert(tk.END, f"\n🔽 AI difficulty decreased to ELO {self.ai_elo}\n")
+                    self.chat_display.see(tk.END)
+            except Exception as e:
+                print(f"⚠️ Could not update UI: {e}")
 
     def reset_game(self):
         """Reset the game after checkmate or draw."""
@@ -671,13 +854,22 @@ Be concise."""
             
             # Get response from Gemini
             response = self.model.generate_content(prompt)
+            
+            # Check if response was blocked
+            if not response.candidates or not response.candidates[0].content.parts:
+                print(f"⚠️ Response blocked. Reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}")
+                self.chat_display.insert(tk.END, "\n⚠️ AI suggestion unavailable (response filtered)\n")
+                self.chat_display.see(tk.END)
+                return
+            
             suggestion = response.text
             
             # Display the suggestion in the chat
-            self.chat_display.insert(tk.END, f"\nAI Suggestion: {suggestion}\n")
+            self.chat_display.insert(tk.END, f"\n💡 AI Suggestion: {suggestion}\n")
             self.chat_display.see(tk.END)
             
         except Exception as e:
+            print(f"⚠️ Could not get AI suggestion: {e}")
             messagebox.showerror("Error", f"Failed to get AI suggestion: {str(e)}")
     
     def send_message(self):
@@ -704,14 +896,24 @@ Provide a brief, direct response in 1-2 sentences."""
             
             # Get response from Gemini
             response = self.model.generate_content(prompt)
+            
+            # Check if response was blocked
+            if not response.candidates or not response.candidates[0].content.parts:
+                finish_reason = response.candidates[0].finish_reason if response.candidates else 'Unknown'
+                self.chat_display.insert(tk.END, f"\n⚠️ Response unavailable (filtered: {finish_reason})\n")
+                self.chat_display.see(tk.END)
+                return
+            
             ai_response = response.text
             
             # Display AI response
-            self.chat_display.insert(tk.END, f"\nAI: {ai_response}\n")
+            self.chat_display.insert(tk.END, f"\n🤖 AI: {ai_response}\n")
             self.chat_display.see(tk.END)
             
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to send message: {str(e)}")
+            print(f"⚠️ Chat error: {e}")
+            self.chat_display.insert(tk.END, f"\n⚠️ Error: Could not get response\n")
+            self.chat_display.see(tk.END)
 
     def initialize_stockfish(self):
         """Initialize the Stockfish chess engine"""
@@ -720,8 +922,15 @@ Provide a brief, direct response in 1-2 sentences."""
             if not os.path.exists(self.STOCKFISH_PATH):
                 raise FileNotFoundError(f"Stockfish executable not found at: {self.STOCKFISH_PATH}")
             
-            self.engine = chess.engine.SimpleEngine.popen_uci(self.STOCKFISH_PATH)
-            print("✅ Stockfish engine loaded successfully!")
+            # Try to initialize the engine with a timeout
+            try:
+                self.engine = chess.engine.SimpleEngine.popen_uci(self.STOCKFISH_PATH, timeout=5.0)
+                # Test the engine with a simple command
+                self.engine.ping()
+                print("✅ Stockfish engine loaded successfully!")
+            except Exception as engine_error:
+                raise Exception(f"Engine initialization failed: {str(engine_error)}")
+                
         except Exception as e:
             print(f"❌ Error loading Stockfish: {str(e)}")
             messagebox.showerror("Error", f"Stockfish engine could not be loaded: {str(e)}\nPlease verify the path: {self.STOCKFISH_PATH}")
@@ -743,62 +952,108 @@ Provide a brief, direct response in 1-2 sentences."""
             self.chat_display.insert(tk.END, "\nMove judgment turned off\n")
             self.chat_display.see(tk.END)
 
+    def manual_difficulty_adjustment(self, value):
+        """Manually adjust AI difficulty via slider"""
+        try:
+            self.ai_elo = int(float(value))
+            self.ai_label.config(text=f"AI (Black): {self.ai_wins} wins | ELO: {self.ai_elo}")
+            print(f"🎚️ Manual ELO adjustment: {self.ai_elo}")
+        except Exception as e:
+            print(f"⚠️ Error adjusting difficulty: {e}")
+
     def get_game_commentary(self):
         """Get real-time commentary about the current game state"""
         try:
+            if not hasattr(self, 'model') or not self.model:
+                print("⚠️ Gemini model not initialized")
+                return
+                
             context = self.get_game_context()
-            prompt = f"""As a chess commentator, provide a brief, engaging commentary about the current game state:
+            prompt = f"""You are a chess commentator. Provide brief commentary on this game:
 
 {context}
 
-Focus on:
-1. Current position evaluation
-2. Key tactical or strategic elements
-3. Potential threats or opportunities
-Keep it concise and engaging."""
+Provide 2-3 sentences about the current position, tactics, or strategy."""
             
             response = self.model.generate_content(prompt)
+            
+            # Check if response was blocked
+            if not response.candidates or not response.candidates[0].content.parts:
+                print(f"⚠️ Response blocked. Reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}")
+                if hasattr(self, 'chat_display') and self.chat_display:
+                    self.chat_display.insert(tk.END, "\n⚠️ Commentary unavailable (response filtered)\n")
+                    self.chat_display.see(tk.END)
+                return
+            
             commentary = response.text
             
-            self.chat_display.insert(tk.END, f"\nCommentary: {commentary}\n")
-            self.chat_display.see(tk.END)
+            if hasattr(self, 'chat_display') and self.chat_display:
+                self.chat_display.insert(tk.END, f"\n💬 Commentary: {commentary}\n")
+                self.chat_display.see(tk.END)
             
         except Exception as e:
-            print(f"Error getting commentary: {e}")
+            print(f"⚠️ Could not generate commentary: {e}")
+            if hasattr(self, 'chat_display') and self.chat_display:
+                self.chat_display.insert(tk.END, "\n⚠️ Commentary error\n")
+                self.chat_display.see(tk.END)
 
     def judge_last_move(self):
         """Judge the last move made in the game"""
         try:
             if not self.previous_move:
                 return
+            
+            if not hasattr(self, 'model') or not self.model:
+                print("⚠️ Gemini model not initialized")
+                return
                 
             context = self.get_game_context()
-            prompt = f"""As a chess expert, evaluate the last move made in this game:
+            prompt = f"""Evaluate this chess move:
 
-{context}
-
+Game context: {context}
 Last move: {self.previous_move}
 
-Provide a brief evaluation:
-1. Is it a good move? (Excellent/Good/Questionable/Poor)
-2. One sentence explanation why
-Keep it concise."""
+Rate the move (Excellent/Good/Questionable/Poor) and explain in one sentence."""
             
             response = self.model.generate_content(prompt)
+            
+            # Check if response was blocked
+            if not response.candidates or not response.candidates[0].content.parts:
+                print(f"⚠️ Response blocked. Reason: {response.candidates[0].finish_reason if response.candidates else 'Unknown'}")
+                if hasattr(self, 'chat_display') and self.chat_display:
+                    self.chat_display.insert(tk.END, "\n⚠️ Move judgment unavailable\n")
+                    self.chat_display.see(tk.END)
+                return
+            
             judgment = response.text
             
-            self.chat_display.insert(tk.END, f"\nMove Judgment: {judgment}\n")
-            self.chat_display.see(tk.END)
+            if hasattr(self, 'chat_display') and self.chat_display:
+                self.chat_display.insert(tk.END, f"\n⚖️ Move Judgment: {judgment}\n")
+                self.chat_display.see(tk.END)
             
         except Exception as e:
-            print(f"Error judging move: {e}")
+            print(f"⚠️ Could not judge move: {e}")
+            if hasattr(self, 'chat_display') and self.chat_display:
+                self.chat_display.insert(tk.END, "\n⚠️ Judgment error\n")
+                self.chat_display.see(tk.END)
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    root.configure(bg="#2C3E50")
-    gui = ChessGUI(root)
-    
-    # Bind the window close button (cross) to our custom on_close method
-    root.protocol("WM_DELETE_WINDOW", gui.on_close)
-    
-    root.mainloop()
+    print("Starting chess application...")
+    try:
+        print("Initializing Tkinter...")
+        root = tk.Tk()
+        print("Configuring root window...")
+        root.configure(bg="#2C3E50")
+        print("Creating ChessGUI instance...")
+        gui = ChessGUI(root)
+        
+        # Bind the window close button (cross) to our custom on_close method
+        print("Setting up window close handler...")
+        root.protocol("WM_DELETE_WINDOW", gui.on_close)
+        
+        print("Starting main loop...")
+        root.mainloop()
+    except Exception as e:
+        print(f"Error starting application: {str(e)}")
+        import traceback
+        traceback.print_exc()
